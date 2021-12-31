@@ -1,12 +1,16 @@
 // axum mTLS example based on https://github.com/tokio-rs/axum/blob/main/examples/low-level-rustls/src/main.rs
 use axum::{extract::ConnectInfo, routing::get, Router};
+use axum::http::HeaderValue;
 use futures_util::future::poll_fn;
 use hyper::server::{
     accept::Accept,
     conn::{AddrIncoming, Http},
 };
 use rustls_pemfile::{certs, pkcs8_private_keys};
-use std::{fs::File, io::BufReader, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{env, fs::File, io::BufReader, net::SocketAddr, pin::Pin, sync::Arc};
+use axum::http::Request;
+use axum::body::Body;
+use axum::response::IntoResponse;
 use tokio::net::TcpListener;
 use tokio_rustls::{
     rustls,
@@ -29,7 +33,16 @@ async fn main() {
 
     let cert = "./tls/server.pem";
     let key = "./tls/server-key-pkcs8.pem";
-    let ca = Some("./tls/ca.pem");
+    let mut ca = Some("./tls/ca.pem");
+
+    let mut args = env::args();
+    // skip self
+    args.next();
+    if let Some(flag) = args.next() {
+        if flag == "--no-mtls" {
+            ca = None
+        }
+    }
 
     let rustls_config = build_rustls_server_config(cert, key, ca).await;
 
@@ -62,7 +75,11 @@ async fn main() {
     }
 }
 
-async fn handler(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> String {
+async fn handler(ConnectInfo(addr): ConnectInfo<SocketAddr>, request: Request<Body>) -> impl IntoResponse {
+    let ConnectInfo(addr) = request.extensions().get::<ConnectInfo<SocketAddr>>().unwrap();
+    let empty_ua = HeaderValue::from_static("");
+    let user_agent = request.headers().get("User-Agent").or_else(||{Some(&empty_ua)}).unwrap().to_str().unwrap();
+    tracing::info!("remote_addr={} method={} uri={} user_agent={}", addr, request.method(), request.uri(), user_agent);
     addr.to_string()
 }
 
@@ -83,11 +100,15 @@ async fn build_rustls_server_config(cert: &str, key: &str, ca: Option<&str>) -> 
     let config_builder = rustls::ServerConfig::builder().with_safe_defaults();
 
     let mut server_config = match ca {
-        None => config_builder
-            .with_no_client_auth()
-            .with_single_cert(cert, key)
-            .expect("bad certificate/key"),
+        None => {
+            tracing::info!("mTLS disabled");
+            config_builder
+                .with_no_client_auth()
+                .with_single_cert(cert, key)
+                .expect("bad certificate/key")
+        },
         Some(ca) => {
+            tracing::info!("mTLS enabled, ca cert path={}", ca);
             let ca = tokio::fs::read(ca).await.unwrap();
             if let Some(Item::X509Certificate(ca)) =
                 rustls_pemfile::read_one(&mut ca.as_ref()).unwrap()
